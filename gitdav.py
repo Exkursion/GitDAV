@@ -48,12 +48,17 @@ from urllib.parse import unquote
 import requests
 import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 CONFIG_FILE = "config.json"
 LOG_FILE = "sync.log"
-USER_AGENT = "gh-nc-webdav-sync/0.6"
+USER_AGENT = "gh-nc-webdav-sync/0.7"
 DEFAULT_EXCLUDE_NAME = "exclude.conf"
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 120
+LONG_READ_TIMEOUT = 300
 
 
 # -----------------------------
@@ -175,13 +180,32 @@ class WebDAVClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
 
+        # WAN/NFS-backed Nextcloud can occasionally stall or close idle connections.
+        # Retry transient transport failures instead of killing the daemon.
+        retry = Retry(
+            total=5,
+            connect=3,
+            read=5,
+            status=3,
+            backoff_factor=2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset([
+                "GET", "HEAD", "PUT", "DELETE", "PROPFIND", "MKCOL", "MOVE"
+            ]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
     def _req(self, method: str, url: str, **kwargs) -> requests.Response:
+        timeout = kwargs.pop("timeout", (CONNECT_TIMEOUT, READ_TIMEOUT))
         resp = self.session.request(
             method=method,
             url=url,
             auth=self.auth,
             verify=self.verify_tls,
-            timeout=60,
+            timeout=timeout,
             **kwargs,
         )
         if resp.status_code >= 400 and resp.status_code != 207:
@@ -190,8 +214,25 @@ class WebDAVClient:
 
     def exists(self, remote_path: str) -> bool:
         url = join_webdav(self.base_url, remote_path)
-        resp = self.session.request("HEAD", url, auth=self.auth, verify=self.verify_tls, timeout=30)
-        return resp.status_code in (200, 204, 207)
+        try:
+            resp = self.session.request(
+                "HEAD",
+                url,
+                auth=self.auth,
+                verify=self.verify_tls,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+            return resp.status_code in (200, 204, 207)
+        except requests.exceptions.RequestException as e:
+            # HEAD can be brittle through reverse proxies / Nextcloud WebDAV.
+            # Fallback to PROPFIND Depth: 0, which is the native WebDAV existence check.
+            logging.warning(f"HEAD failed for {remote_path}; trying PROPFIND Depth:0: {e}")
+            try:
+                self.propfind(remote_path.strip("/") + "/", depth=0)
+                return True
+            except Exception as e2:
+                logging.warning(f"PROPFIND fallback failed for {remote_path}: {e2}")
+                return False
 
     def mkcol(self, remote_path: str) -> None:
         url = join_webdav(self.base_url, remote_path)
@@ -221,7 +262,7 @@ class WebDAVClient:
             pass
 
         url = join_webdav(self.base_url, rp)
-        resp = self.session.request("DELETE", url, auth=self.auth, verify=self.verify_tls, timeout=60)
+        resp = self.session.request("DELETE", url, auth=self.auth, verify=self.verify_tls, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         if resp.status_code in (200, 204, 404):
             return
         if resp.status_code >= 400:
@@ -285,7 +326,7 @@ class WebDAVClient:
 
     def get_text(self, remote_path: str) -> Optional[str]:
         url = join_webdav(self.base_url, remote_path)
-        resp = self.session.get(url, auth=self.auth, verify=self.verify_tls, timeout=60)
+        resp = self.session.get(url, auth=self.auth, verify=self.verify_tls, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
@@ -409,7 +450,7 @@ class GitHubClient:
         })
 
     def _req(self, method: str, url: str, **kwargs) -> Any:
-        resp = self.session.request(method, url, timeout=60, **kwargs)
+        resp = self.session.request(method, url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs)
         if resp.status_code >= 400:
             raise RuntimeError(f"GitHub {method} {url} -> {resp.status_code}: {resp.text[:400]}")
         if resp.text.strip() == "":
@@ -420,7 +461,7 @@ class GitHubClient:
         repos: List[dict] = []
         url = f"{self.api_base}/user/repos?per_page=100&sort=updated"
         while url:
-            resp = self.session.get(url, timeout=60)
+            resp = self.session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             if resp.status_code >= 400:
                 raise RuntimeError(f"GitHub GET {url} -> {resp.status_code}: {resp.text[:200]}")
             repos.extend(resp.json())
@@ -442,7 +483,7 @@ class GitHubClient:
 
     def download_repo_zip(self, owner: str, repo: str, branch: str = "main") -> bytes:
         url = f"{self.api_base}/repos/{owner}/{repo}/zipball/{branch}"
-        resp = self.session.get(url, timeout=120)
+        resp = self.session.get(url, timeout=(CONNECT_TIMEOUT, LONG_READ_TIMEOUT))
         if resp.status_code >= 400:
             raise RuntimeError(f"GitHub ZIP {url} -> {resp.status_code}: {resp.text[:200]}")
         return resp.content
@@ -574,9 +615,14 @@ class RepoSync:
         arch_remote = f"{project_root}/{rc.archive_dir}".strip("/")
         exclude_remote = f"{project_root}/{rc.exclude_file}".strip("/")
 
-        self.wd.ensure_dir(active_remote)
-        self.wd.ensure_dir(push_remote)
-        self.wd.ensure_dir(arch_remote)
+        try:
+            self.wd.ensure_dir(active_remote)
+            self.wd.ensure_dir(push_remote)
+            self.wd.ensure_dir(arch_remote)
+        except Exception as e:
+            logs.append(f"[{rc.name}] ERROR ensuring WebDAV dirs: {e}")
+            logging.exception(f"[{rc.name}] ensure_dir failed")
+            return rc, logs
 
         # Pull
         try:
